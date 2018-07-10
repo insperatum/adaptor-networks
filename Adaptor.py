@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch import optim
 from torch.nn import Parameter
+from torch.autograd import Function
 softplus = nn.Softplus()
 from torch.distributions.dirichlet import Dirichlet
 
@@ -18,9 +19,9 @@ class Base(nn.Module):
     def forward(self, xs):
         return torch.rand(len(xs))-10
 
-class Adaptor(nn.Module):
+class Adaptor2(nn.Module):
     """
-    Reparametrised q(phi)
+    TODO: Make much faster. e.g. use dict keys rather than list.index
     Single valued q(mu_i)
     """
     def __init__(self, T, base):
@@ -31,9 +32,43 @@ class Adaptor(nn.Module):
         self._sigma = Parameter(torch.zeros(T))
         self.T = T
         self.t = Parameter(torch.ones(1))
+        self.add_queue = set()
 
     @property
     def sigma(self): return softplus(self._sigma)
+
+    def getComponentProbs(self, xs, log_pi):
+        return self.GetComponentProbs.apply(self.add_queue, self.values, xs, log_pi)
+
+    class GetComponentProbs(Function):
+        @staticmethod
+        def forward(ctx, add_queue, values, xs, log_pi):
+            ctx.saved = (add_queue, values, xs, log_pi)
+
+            log_pi_inf = torch.cat([log_pi, log_pi.new_full((len(xs), 1), float("-inf"))],
+                                    dim=1)
+            idxs = [values.index(x) if x in values else log_pi_inf.size(1)-1 for x in xs]
+            component_probs = log_pi_inf.gather(1, log_pi.new(idxs).long().view(-1,1))[:, 0]
+            return component_probs
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            add_queue, values, xs, log_pi = ctx.saved
+
+            # Add any missing values to the queue to be added
+            xs_set = set(xs)
+            missing = xs_set - set(values)
+            add_queue.update(missing)
+ 
+            # Propagate gradients only on values that were already there
+            if len(missing) == len(xs_set):
+                g = log_pi.new_zeros(log_pi.size())
+            else:
+                idxs = log_pi.new([values.index(x) if x not in missing else 0 for x in xs]).long().unsqueeze(1)
+                grad_in = grad_output.masked_fill(log_pi.new([x in missing for x in xs]).byte(), 0).unsqueeze(1)
+                g = log_pi.new_zeros(log_pi.size()).scatter(dim=1, index=idxs, source=grad_in)
+
+            return None, None, None, g
 
     def E_pi(self, n_samples=100): 
         dist = NormalLogSoftmax(self.mu.data.unsqueeze(0).repeat(n_samples,1),
@@ -45,38 +80,28 @@ class Adaptor(nn.Module):
         :param xs: list(batch) of strings
         """
         batch_size = len(xs)
-        xs_set = set(xs)
- 
-        # Ensure all xs are in the mixture distribution
-        missing = list(xs_set - set(self.values))
-        replace_idxs = [idx for idx in np.argpartition(self.mu.data, len(missing))
-                            if self.values[idx] not in xs_set
-                        ][:len(missing)]
-        for idx, value in zip(replace_idxs, missing):
-            self.values[idx] = value
+
+        # Add any values waiting to be added
+        if len(self.add_queue)>0:
+            replace_idxs = [idx for idx in np.argpartition(self.mu.data, len(self.add_queue))][:len(self.add_queue)]
+            for idx, value in zip(replace_idxs, self.add_queue):
+                self.values[idx] = value
+            self.add_queue.clear()
 
         # Sample weights
-        dist = NormalLogSoftmax(self.mu.unsqueeze(0).repeat(batch_size, 1),
-                                self.sigma.unsqueeze(0).repeat(batch_size, 1))
+        dist = NormalLogSoftmax(self.mu.unsqueeze(0).repeat(batch_size, 1), self.sigma.unsqueeze(0).repeat(batch_size, 1))
         log_pi = dist.rsample()
         p_pi = Dirichlet(1*self.t.new_ones(batch_size, self.T+1)).log_prob(log_pi.exp()) 
         jacobian = -log_pi.sum(dim=1) #todo: double check this
         p_log_pi = p_pi - jacobian
         q_log_pi = dist.log_prob(log_pi)
 
-        # Calculate probabilities from mixture distribution and base distribution
-        idxs = [self.values.index(x) for x in xs]
-        component_probs = log_pi.gather(1, log_pi.new(idxs).long().view(-1,1))[:, 0]
+        # Calculate probabilities from mixture distribution and base distribution 
+        component_probs = self.getComponentProbs(xs, log_pi)
         base_probs = log_pi[:, -1] + self.base(xs)
 
         #Total
-        if len(missing)==0:
-            existing_component_probs = component_probs
-        else:
-            #missing_idxs = self.t.new([xs.index(x) for x in missing]).long()
-            missing_idxs = self.t.new([i for i,x in enumerate(xs) if x in missing]).long()
-            existing_component_probs = component_probs.index_fill(0, missing_idxs, float("-inf"))
-        conditional = logsumexp(torch.cat([existing_component_probs[:, None], base_probs[:, None]], dim=1))
+        conditional = logsumexp(torch.cat([component_probs[:, None], base_probs[:, None]], dim=1))
         
         # Variational bound
         score = ((p_log_pi - q_log_pi)/nData + conditional).mean()
@@ -87,7 +112,7 @@ class Adaptor(nn.Module):
 if __name__ == "__main__":
     #import string
     base = Base()
-    adaptor = Adaptor(20, base)
+    adaptor = Adaptor2(30, base)
 
     optimiser = optim.Adam(adaptor.parameters(), lr=1e-2)
     data = """
@@ -99,12 +124,10 @@ if __name__ == "__main__":
         for iteration in range(100):
             optimiser.zero_grad()
             xs = list(np.random.choice(data, size=batch_size))
-            #xs = ["".join(np.random.choice(list(string.ascii_lowercase), size=5))
-            #        for _ in range(batch_size)]
             score = adaptor(xs, nData=len(data))
             (-score).backward()
             optimiser.step()
-        #print("Batch", batch, "Score", score.item())
+
         E_pi = adaptor.E_pi()
         pv = list(zip(adaptor.E_pi(), adaptor.values))
         pv = sorted(((p,v) for p,v in pv if v is not None), reverse=True)
